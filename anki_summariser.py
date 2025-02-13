@@ -2,6 +2,8 @@
 # coding: utf-8
 
 import os
+import re
+
 import pandas as pd
 from tqdm import tqdm
 
@@ -127,50 +129,7 @@ def summarise_duplicates(duplicate_summaries: str, llm_model: ChatOpenAI) -> str
     return merged_result.content
 
 
-# -----------------------------------------------------------------------------
-# Main Processing Function
-# -----------------------------------------------------------------------------
-
-
-def summarise_anki_deck(anki_search_query, anki_columns, gpt_model="gpt-4o-mini"):
-    # ---------------------------
-    # Setup and Data Loading
-    # ---------------------------
-    # Set OpenAI API key (ensure you keep your key secure)
-
-    # Load Anki deck data into a DataFrame (example deck)
-    anki_df = load_anki_query_to_dataframe(anki_search_query)
-    anki_df[anki_columns] = anki_df[anki_columns]
-
-    # Initialize the LLM model for generating card summaries using GPT-4 with temperature 0.
-    llm_model = ChatOpenAI(model=gpt_model, temperature=0)
-    structured_summary_llm = llm_model.with_structured_output(AnkiContent)
-
-    # ---------------------------
-    # Generate Structured Summaries for Each Card
-    # ---------------------------
-    for index in tqdm(range(len(anki_df)), desc="Summarizing Cards"):
-        # Concatenate all relevant fields from the card
-        card_content = anki_df.loc[index][anki_columns].str.cat()
-
-        # Generate the structured summary for the card
-        card_summary: AnkiContent = generate_card_summary(
-            card_content, structured_summary_llm
-        )
-
-        # Display the summary in the notebook (optional)
-        print("---- Summary for Card {} ----".format(index))
-        display(Markdown(card_summary.body))
-
-        # Save the summary back to the DataFrame
-        anki_df.loc[index, "summary"] = card_summary.body
-
-        # Save progress intermittently
-        anki_df.to_pickle("temp.pkl")
-
-    # ---------------------------
-    # Rank Cards and Identify Duplicates
-    # ---------------------------
+def get_card_order(anki_titles_text: str, llm_model: ChatOpenAI) -> str:
     # Build the prompt to rank Anki cards and mark duplicates
     ranking_prompt_template = ChatPromptTemplate.from_template(
         """Given the following Anki card titles from a course, rank them based on their natural material order.
@@ -184,12 +143,6 @@ def summarise_anki_deck(anki_search_query, anki_columns, gpt_model="gpt-4o-mini"
             Output the results in JSON format following the provided structured schema.
 """
     )
-
-    # Create a single string combining card numbers and titles for the ranking prompt.
-    anki_titles_text = (
-        "card number: " + anki_df["card_number"] + "     " + anki_df["f"]
-    ).str.cat()
-
     # Initialize the LLM for ranking using the structured output schema.
     structured_ranking_llm = llm_model.with_structured_output(RankedAnkiList)
     ranking_prompt_instance = ranking_prompt_template.invoke(
@@ -212,15 +165,99 @@ def summarise_anki_deck(anki_search_query, anki_columns, gpt_model="gpt-4o-mini"
     ]
     ranking_df = pd.DataFrame(ranking_data)
 
+    return ranking_df
+
+
+def filter_extras(strings):
+    pattern = r"\bextras?\b"  # Matches "extra" or "extras" as whole words
+    return [s for s in strings if not re.search(pattern, s, re.IGNORECASE)]
+
+
+# -----------------------------------------------------------------------------
+# Main Processing Function
+# -----------------------------------------------------------------------------
+
+
+def summarise_anki_deck(anki_search_query, gpt_model="gpt-4o-mini"):
+    # ---------------------------
+    # Setup and Data Loading
+    # ---------------------------
+    # Set OpenAI API key (ensure you keep your key secure)
+
+    # Load Anki deck data into a DataFrame (example deck)
+    anki_df = load_anki_query_to_dataframe(anki_search_query)
+    anki_columns = list(anki_df.columns)[::-1]
+    anki_columns = filter_extras(anki_columns)  # remove "extras" fields
+
+    # Initialize the LLM model for generating card summaries using GPT-4 with temperature 0.
+    llm_model = ChatOpenAI(model=gpt_model, temperature=0)
+    structured_summary_llm = llm_model.with_structured_output(AnkiContent)
+
+    # ---------------------------
+    # Generate Structured Summaries for Each Card
+    # ---------------------------
+    start_idx = 0
+    is_finished = False
+
+    while True:
+        response = input("Do you want to retry? (yes/no): ").strip().lower()
+        if response == "yes":
+            print("Retrying...")
+            anki_df = pd.read_pickle(f"temp_{anki_search_query}.pkl")
+            anki_df_to_process = anki_df[anki_df.summary.isna()]
+            if len(anki_df_to_process) == 0:
+                is_finished = True
+                print("nothing to process. All summaries generated ....")
+                break
+            start_idx = min(anki_df[anki_df.summary.isna()].index)
+            break
+        elif response == "no":
+            print("Exiting...")
+            break
+        else:
+            print("Invalid input. Please enter 'yes' or 'no'.")
+
+    if not is_finished:
+        print(f"starting at index {start_idx}")
+        for index in tqdm(range(start_idx, len(anki_df)), desc="Summarizing Cards"):
+            # Concatenate all relevant fields from the card
+            card_content = anki_df.loc[index][anki_columns].str.cat()
+
+            # Generate the structured summary for the card
+            card_summary: AnkiContent = generate_card_summary(
+                card_content, structured_summary_llm
+            )
+
+            # Display the summary in the notebook (optional)
+            print("---- Summary for Card {} ----".format(index))
+            display(Markdown(card_summary.body))
+
+            # Save the summary back to the DataFrame
+            anki_df.loc[index, "summary"] = card_summary.body
+
+            # Save progress intermittently
+            anki_df.to_pickle(f"temp_{anki_search_query}.pkl")
+
+    # ---------------------------
+    # Rank Cards and Identify Duplicates
+    # ---------------------------
+    print("Ranking Cards Titles based on course order ......")
+
+    # Create a single string combining card numbers and titles for the ranking prompt.
+    anki_titles_text = (
+        "card number: " + anki_df["card_number"] + "     " + anki_df["f"]
+    ).str.cat()
+
+    ranking_df = get_card_order(anki_titles_text=anki_titles_text, llm_model=llm_model)
+
     # Validate that all card numbers match between the ranking and original DataFrame.
-    ranked_numbers = {card.card_number for card in ranking_response.ranked_list}
+    ranked_numbers = set(ranking_df.card_number)
     original_numbers = set(anki_df.card_number)
-    assert (
-        ranked_numbers == original_numbers
-    ), "Mismatch between ranked cards and original cards."
+    print("unranked cards", original_numbers - ranked_numbers)
 
     # Merge ranking information with the original card data.
-    merged_df = ranking_df.merge(anki_df, on="card_number")
+    merged_df = anki_df.merge(ranking_df, on="card_number", how="left")
+    merged_df["rank"] = merged_df["rank"].fillna(10000)
 
     # Extract rows that have been identified as duplicates.
     duplicates_df = merged_df[~merged_df.duplicate_group.isna()]
@@ -228,6 +265,7 @@ def summarise_anki_deck(anki_search_query, anki_columns, gpt_model="gpt-4o-mini"
     # ---------------------------
     # Deduplicate Duplicate Card Summaries
     # ---------------------------
+    print("de-duplicating cards .......")
     deduped_summaries = []
     for duplicate_id, group in duplicates_df.groupby("duplicate_group"):
         # Use the smallest rank among duplicates as the representative rank.
@@ -251,13 +289,20 @@ def summarise_anki_deck(anki_search_query, anki_columns, gpt_model="gpt-4o-mini"
     # ---------------------------
     # Combine Non-Duplicate and Deduplicated Cards and Output
     # ---------------------------
-    final_df = pd.concat([merged_df[~merged_df.is_duplicate], deduped_df])
+    if len(deduped_df) == 0:
+        print("no duplicates ...")
+        final_df = merged_df
+    else:
+        final_df = pd.concat([merged_df[~merged_df.is_duplicate], deduped_df])
     final_df = final_df.sort_values("rank")
+
+    final_df["title"] = final_df["title"].fillna("(Unranked by GPT) - " + final_df["f"])
 
     # Create a markdown formatted string combining title and summary for each card.
     final_df["title_and_summary"] = (
         "**" + final_df["title"] + "** \n" + final_df["summary"] + " \n"
     )
+
     final_markdown = "\n".join(final_df.title_and_summary.tolist())
 
     # Write the final markdown output to a file.
@@ -267,3 +312,11 @@ def summarise_anki_deck(anki_search_query, anki_columns, gpt_model="gpt-4o-mini"
 
     # Optionally, display the final markdown in the notebook.
     # display(Markdown(final_markdown))
+
+
+if __name__ == "__main__":
+    df = load_anki_query_to_dataframe('"deck:Quant::Linear Algebra::Theory"')
+    summarise_anki_deck(
+        anki_search_query='"deck:Quant::ML::Essential::GenAI::Langchain::Langchain Acedemy (Official)"',
+        gpt_model="gpt-4o",
+    )
